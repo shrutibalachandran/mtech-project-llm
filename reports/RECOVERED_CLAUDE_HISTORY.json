@@ -1,5 +1,5 @@
 {
-  "_forensic_notes": "DIGITAL FORENSIC INTEGRITY STATEMENT: This file contains ONLY data physically recovered from binary artifacts. No AI text generation or falsification used. Filtered: [No cached content] placeholder entries removed.",
+  "_forensic_notes": "DIGITAL FORENSIC INTEGRITY STATEMENT: This file contains ONLY data physically recovered from binary artifacts. No AI text generation or falsification used.",
   "items": [
     {
       "conversation_id": "0a5b59b4-fa0e-4e1b-9b42-27ab972b2c8c",
@@ -357,21 +357,6 @@
         "snippet": "[No cached content] created=2025-06-09T09:07:10.997811Z updated=2025-06-09T09:07:10.997811Z"
       },
       "source_file": "data_1"
-    },
-    {
-      "conversation_id": "019cece5-b975-747a-a6a3-4c7892974f86",
-      "current_node_id": "",
-      "title": "s generative AI",
-      "model": "",
-      "is_archived": false,
-      "is_starred": false,
-      "update_time": 0.0,
-      "payload": {
-        "kind": "message",
-        "message_id": "",
-        "snippet": "[Recovered from IndexedDB blob - V8 serialized conversation list]"
-      },
-      "source_file": "IndexedDB/blob_26"
     }
   ]
 }
