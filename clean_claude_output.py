@@ -50,7 +50,14 @@ def clean_claude_json(input_path: str, output_path: str):
         return
 
     before = len(items)
-    cleaned = [item for item in items if not is_noise_entry(item)]
+    cleaned = []
+    for item in items:
+        if not is_noise_entry(item):
+            # Ensure "kind" is always "message", even for timestamped placeholders
+            # to avoid JSON corruption in the output schema
+            if "payload" in item and item["payload"].get("kind") == "conversation_metadata":
+                item["payload"]["kind"] = "message"
+            cleaned.append(item)
     after = len(cleaned)
 
     print(f"  Total entries before: {before}")

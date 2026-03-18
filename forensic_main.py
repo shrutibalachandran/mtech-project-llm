@@ -580,9 +580,10 @@ def extract_fields_from_object(obj: Any, ctx: dict | None = None, is_claude: boo
     """
     global CLAUDE_JSON_OBJECTS_FOUND
     
-    # FIX 1: Strict Claude JSON Gate (User Specified)
+    # FIX 1: Relaxed Claude JSON Gate to allow message objects while blocking pure noise
     if is_claude:
-        if not ("chat_messages" in obj or "messages" in obj):
+        valid_keys = {"chat_messages", "messages", "uuid", "conversation_id", "title", "text", "sender", "author", "role"}
+        if not any(k in obj for k in valid_keys):
             return []
         CLAUDE_JSON_OBJECTS_FOUND += 1
 
@@ -1440,9 +1441,6 @@ def group_and_deduplicate(records: list[dict]) -> list[dict]:
             continue
             
         # FILTER: Drop only completely empty placeholder entries.
-        # Entries with "[No cached content] created= updated=" come from Chromium index files (f_*)
-        # and contain no real forensics. However, entries with actual created/updated timestamps 
-        # (like "React Tabs") should be kept as proof of conversation existence.
         if txt_norm == "[No cached content] created= updated=":
             continue
             
