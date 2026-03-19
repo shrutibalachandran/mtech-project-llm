@@ -1234,8 +1234,7 @@ def scan_leveldb(directory: str, label: str) -> tuple[list[dict], int, int]:
                     if is_claude and not r.get("conversation_id"):
                         r["conversation_id"] = "deleted_fragment_pool"
                 records.extend(recs)
-            if is_claude and json_count > 0:
-                print(f"      [DEBUG] {base_name}: JSON objects={json_count}, with conv keys={conv_count}")
+
     print(f"  [LevelDB] {label}: {len(records)} raw records extracted")
     return records, len(log_files), len(ldb_files)
 
@@ -1310,7 +1309,6 @@ def scan_cache(directory: str, label: str) -> tuple[list[dict], int]:
         print(f"  Sample: {', '.join(sample)}")
 
     for filepath in all_files:
-        print(f"    [DEBUG] File: {os.path.basename(filepath)}")
         raw = None
         tmp = f"_tmp_cache_{os.getpid()}_{os.path.basename(filepath)}.bin"
         # Attempt 1: direct read
@@ -1395,18 +1393,7 @@ def scan_cache(directory: str, label: str) -> tuple[list[dict], int]:
                         r["conversation_id"] = "deleted_fragment_pool"
                 records.extend(recs)
 
-            # FIX 4: Debug output of total JSON candidates before filtering
-            if is_claude and (json_candidates_found > 0 or len(buf) > 1000):
-                print(f"      [DEBUG] cand[{ci}] size={len(buf)}: "
-                      f"JSON objects={json_candidates_found}, "
-                      f"with conv keys={json_with_conv_keys}")
 
-            # FIX 5: Decompression validation — show first 200 bytes of each
-            # decompressed candidate so decompression failures are visible
-            if is_claude and ci > 0 and json_candidates_found == 0 and len(buf) > 100:
-                preview = buf[:200].decode("ascii", errors="replace").replace("\n", " ")
-                safe_preview = preview[:150].encode("ascii", errors="replace").decode("ascii")
-                print(f"      [DEBUG] cand[{ci}] preview: {safe_preview}")
 
             # V8 parser for Claude (also with no pre-filter now)
             if is_claude:
