@@ -226,40 +226,33 @@ def _ls_conversation_history(ls_dir: str) -> list:
 
 
 def run_chatgpt(paths: dict):
-    """Full ChatGPT extraction pipeline → single report."""
+    """Full ChatGPT extraction pipeline → single report.
+    Fully portable: works on any machine with ChatGPT Desktop installed.
+    RECOVERED_CHATGPT_GROUPED.json is optionally merged as historical bonus.
+    """
     _sep("─")
-    print("  [1/4] Reading historical recovered data …")
-    old_file = os.path.join(REPORTS, "RECOVERED_CHATGPT_GROUPED.json")
-    if not os.path.isfile(old_file):
-        print(f"  [!] {old_file} not found — live-only mode")
-        old_items = []
-    else:
-        old_raw   = json.load(open(old_file, encoding="utf-8"))
-        old_items = old_raw if isinstance(old_raw, list) else old_raw.get("items", [])
-        print(f"      → {len(old_items)} historical records loaded")
 
-    SKIP = {"Unknown (deleted/orphaned conversation)","New chat","Student",
-            "What is 5","What is apple","Test message response",
-            "Testing cache behavior","Deleted Fragment Recovery",""}
+    SKIP = {"Unknown (deleted/orphaned conversation)", "New chat", "Student",
+            "What is 5", "What is apple", "Test message response",
+            "Testing cache behavior", "Deleted Fragment Recovery", ""}
 
-    convs: dict = {}   # key → {cid, title, ts, msgs, is_archived, is_starred}
+    convs: dict = {}
 
-    def upsert(cid, title, ts, is_arch, is_star, msgs):
+    def upsert(cid, title, ts, is_arch, is_star, msgs, trust_ts=True):
         key = cid if cid else title[:40]
         if not key:
             return
         prev = convs.get(key)
         if prev is None:
-            convs[key] = {"cid":cid,"title":title,"ts":ts,
-                          "is_archived":is_arch,"is_starred":is_star,
-                          "msgs":list(msgs)}
+            convs[key] = {"cid": cid, "title": title, "ts": ts,
+                          "is_archived": is_arch, "is_starred": is_star,
+                          "msgs": list(msgs)}
             return
         if cid and not prev["cid"]:
             prev["cid"] = cid
         if title and title not in SKIP:
             prev["title"] = title
-        # Keep highest ts (only accept batch-free ones ≤ 1773901000)
-        if ts > float(prev["ts"] or 0) and ts < 1_773_901_000:
+        if trust_ts and ts > float(prev["ts"] or 0) and ts < 1_773_902_000:
             prev["ts"] = ts
         prev["is_archived"] = is_arch or prev["is_archived"]
         prev["is_starred"]  = is_star or prev["is_starred"]
@@ -269,34 +262,47 @@ def run_chatgpt(paths: dict):
                 prev["msgs"].append(m)
                 seen.add(m["snippet"][:100])
 
-    # ── Seed from old pipeline ────────────────────────────────────────────
-    for item in old_items:
-        cid   = (item.get("conversation_id") or "").strip()
-        title = (item.get("title") or "").strip()
-        if title in SKIP:
-            continue
-        ts    = float(item.get("latest_update") or item.get("update_time") or 0)
-        msgs  = []
+    def conv_to_msgs(item):
+        ts = float(item.get("update_time") or 0)
+        out = []
         for m in (item.get("messages") or []):
             snip = (m.get("snippet") or m.get("text") or "").strip()
             if is_real(snip):
-                msgs.append({"mid":(m.get("message_id") or m.get("id") or ""),
-                              "role":(m.get("role") or "unknown").lower(),
-                              "snippet":snip[:4000],
-                              "ts":float(m.get("timestamp") or m.get("update_time") or ts)})
-        upsert(cid, title, ts, bool(item.get("is_archived")), bool(item.get("is_starred")), msgs)
+                out.append({"mid":     (m.get("message_id") or m.get("id") or ""),
+                            "role":    (m.get("role") or "unknown").lower(),
+                            "snippet": snip[:4000],
+                            "ts":      float(m.get("timestamp") or m.get("update_time") or ts)})
+        return out
 
-    print(f"      → {len(convs)} unique conversations after deduplication")
+    # ── STEP 1: Full live scan (IDB LDB + Blob + Cache) — works on any machine ──
+    print("  [1/3] Full LevelDB + Blob + Cache scan (live) …")
+    try:
+        import chatgpt_extractor as cex
+        live_convs = cex.run(verbose=False)
+        for item in live_convs:
+            cid   = (item.get("conversation_id") or "").strip()
+            title = (item.get("title") or "").strip()
+            if title in SKIP:
+                continue
+            ts   = float(item.get("update_time") or 0)
+            msgs = conv_to_msgs(item)
+            upsert(cid, title, ts,
+                   bool(item.get("is_archived")), bool(item.get("is_starred")),
+                   msgs, trust_ts=True)
+        print(f"      → {len(live_convs)} live conversations found")
+        print(f"      → {len(convs)} unique after dedup")
+    except Exception as e:
+        print(f"      [warn] Live scan error: {e}")
 
-    # ── Apply accurate per-conversation timestamps from Live LS ──────────
-    print("  [2/4] Scanning live Local Storage for accurate timestamps …")
-    ls_dir = paths.get("ls_ldb","")
+    # ── STEP 2: Apply accurate per-conversation timestamps from LS WAL ──
+    print("  [2/3] Applying accurate timestamps from Local Storage …")
+    ls_dir = paths.get("ls_ldb", "")
     if os.path.isdir(ls_dir):
         ch = _ls_conversation_history(ls_dir)
         applied = 0
         for entry in ch:
-            ecid  = entry.get("conversation_id","")
-            etitle= entry.get("title","")
+            ecid  = entry.get("conversation_id", "")
+            etitle= entry.get("title", "")
             ets   = float(entry.get("update_time") or 0)
             key   = ecid if ecid else etitle[:40]
             if key in convs and ets > 1e9:
@@ -304,81 +310,63 @@ def run_chatgpt(paths: dict):
                 if etitle:
                     convs[key]["title"] = etitle
                 applied += 1
-        print(f"      → {len(ch)} entries found, {applied} timestamps updated")
+        print(f"      → {len(ch)} LS entries, {applied} timestamps corrected")
     else:
         print("      → Local Storage not found")
 
-    # ── Attempt live cache extraction ─────────────────────────────────────
-    print("  [3/4] Scanning live HTTP cache …")
-    cache_dir = paths.get("cache","")
-    cache_found = 0
-    if os.path.isdir(cache_dir):
+    # ── STEP 3 (optional): Merge historical data if present ──
+    old_file = os.path.join(REPORTS, "RECOVERED_CHATGPT_GROUPED.json")
+    if os.path.isfile(old_file):
+        print("  [3/3] Merging historical data (RECOVERED_CHATGPT_GROUPED.json) …")
         try:
-            import chatgpt_extractor as cex
-            cache_hits = cex.scan_cache(cache_dir, verbose=False)
-            for h in cache_hits:
-                cid   = h.get("conversation_id","")
-                title = h.get("title","")
-                ts    = float(h.get("update_time") or 0)
-                msgs  = []
-                for m in h.get("messages",[]):
-                    snip = m.get("snippet","")
-                    if is_real(snip):
-                        msgs.append({"mid":m.get("message_id",""),
-                                     "role":m.get("role","unknown"),
-                                     "snippet":snip[:4000],
-                                     "ts":float(m.get("timestamp") or ts)})
-                upsert(cid, title, ts, False, False, msgs)
-                cache_found += 1
+            old_raw   = json.load(open(old_file, encoding="utf-8"))
+            old_items = old_raw if isinstance(old_raw, list) else old_raw.get("items", [])
+            pre = len(convs)
+            for item in old_items:
+                cid   = (item.get("conversation_id") or "").strip()
+                title = (item.get("title") or "").strip()
+                if title in SKIP:
+                    continue
+                ts   = float(item.get("latest_update") or item.get("update_time") or 0)
+                msgs = conv_to_msgs(item)
+                upsert(cid, title, ts,
+                       bool(item.get("is_archived")), bool(item.get("is_starred")),
+                       msgs, trust_ts=(ts < 1_773_901_000))
+            added = len(convs) - pre
+            print(f"      → {len(old_items)} records, {added} new conversations added from history")
         except Exception as e:
-            print(f"      [warn] Cache scan error: {e}")
-        print(f"      → {cache_found} conversations from live cache")
+            print(f"      [warn] Historical merge failed: {e}")
     else:
-        print("      → Cache directory not found")
+        print("  [3/3] No historical file — running in portable (live-only) mode")
 
-    # ── Build output ──────────────────────────────────────────────────────
-    print("  [4/4] Building report …")
+    # ── Build output ────────────────────────────────────────────
+    print("      Building report …")
     clist = sorted(convs.values(), key=lambda c: float(c["ts"] or 0), reverse=True)
-
     out_items = []
     for conv in clist:
         cid   = conv["cid"]
         title = conv["title"]
         ts    = float(conv["ts"] or 0)
-        msgs  = sorted(conv["msgs"], key=lambda m: m.get("ts",0))
+        msgs  = sorted(conv["msgs"], key=lambda m: m.get("ts", 0))
         if not msgs:
             out_items.append({
-                "conversation_id": cid,
-                "current_node_id": "",
-                "title": title,
-                "model": "",
-                "is_archived": conv["is_archived"],
-                "is_starred":  conv["is_starred"],
+                "conversation_id": cid, "current_node_id": "",
+                "title": title, "model": "",
+                "is_archived": conv["is_archived"], "is_starred": conv["is_starred"],
                 "update_time": ts,
-                "payload": {"kind":"message","message_id":"",
-                            "snippet":"[No content recovered — metadata only]",
-                            "role":""}
+                "payload": {"kind": "message", "message_id": "",
+                            "snippet": "[No content recovered — metadata only]", "role": ""}
             })
         else:
             for m in msgs:
                 out_items.append({
-                    "conversation_id": cid,
-                    "current_node_id": m["mid"],
-                    "title": title,
-                    "model": "",
-                    "is_archived": conv["is_archived"],
-                    "is_starred":  conv["is_starred"],
+                    "conversation_id": cid, "current_node_id": m["mid"],
+                    "title": title, "model": "",
+                    "is_archived": conv["is_archived"], "is_starred": conv["is_starred"],
                     "update_time": ts,
-                    "payload": {"kind":"message","message_id":m["mid"],
-                                "snippet":m["snippet"],"role":m["role"]}
+                    "payload": {"kind": "message", "message_id": m["mid"],
+                                "snippet": m["snippet"], "role": m["role"]}
                 })
-
-    _write_report("CHATGPT", clist, out_items)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLAUDE EXTRACTION
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def run_claude(paths: dict):
     """Full Claude extraction pipeline → single report."""
