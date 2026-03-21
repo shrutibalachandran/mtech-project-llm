@@ -368,12 +368,239 @@ def run_chatgpt(paths: dict):
                                 "snippet": m["snippet"], "role": m["role"]}
                 })
 
-def run_claude(paths: dict):
-    """Full Claude extraction pipeline → single report."""
-    _sep("─")
+def _scan_claude_idb_blob(paths: dict) -> list:
+    """
+    Scan Claude IndexedDB blob — stores all conversations including latest.
 
-    # ── Try live cache first via claude_extractor ─────────────────────────
-    print("  [1/3] Attempting live cache extraction …")
+    Two-pass approach (discovered from raw blob analysis):
+    - Blob 83 (large file):  conversations_v2 list → uuid, name, ts, leaf_msg_uuid
+    - Blob 89+ (small files): individual message blobs → msg_uuid, role, text
+
+    Pass 1: extract conversation metadata from the large conversations blob
+    Pass 2: extract message content from message blobs  
+    Join:   match via leaf_message uuid
+    """
+    idb_root = paths.get("idb_ldb", "")
+    app_root = paths.get("app_root", "")
+
+    blob_dirs = (
+        glob.glob(os.path.join(idb_root, "*indexeddb.blob")) +
+        glob.glob(os.path.join(app_root, "IndexedDB", "*indexeddb.blob"))
+    )
+    if not blob_dirs:
+        return []
+    blob_base = blob_dirs[0]
+
+    # Gather all blob files, split by size
+    all_blobs = (
+        glob.glob(os.path.join(blob_base, "1", "*")) +
+        glob.glob(os.path.join(blob_base, "1", "**", "*"), recursive=True)
+    )
+    all_blobs = [f for f in all_blobs if os.path.isfile(f)]
+    if not all_blobs:
+        return []
+
+    # Use all blobs for both passes (may be a single large blob with all data)
+    conv_blobs = all_blobs
+
+    # V8 blobs encode strings with length-prefix bytes before content
+    # UUIDs appear as: uuid"[\x04][\x24]a1a60db8-... OR uuid"$a1a60db8-...
+    # The \x24 IS the '$' character (ASCII 36)
+    UUID4_RE     = re.compile(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
+    CONV_UUID_RE = re.compile(
+        r'uuid["\s\x00-\x1f$]{0,12}'
+        r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    )
+    NAME_RE      = re.compile(r'name["\s\x00-\x1f]{0,8}([^\x00-\x1f"\\]{3,120})')
+    UPD_RE       = re.compile(r'updated_a[tN\x00-\x1f][".\s\x00-\x1f]{0,10}(\d{4}-\d{2}-\d{2}T[\d:.]+Z?)')
+    MODEL_RE     = re.compile(r'(claude-[a-z0-9\-]{3,30})')
+    # leaf_message UUID: 5+ arbitrary bytes between key and UUID
+    # Observed: leaf_message[05]>\xef\xbf\xbd"$019d0472-...
+    # Allow any non-hex chars (up to 20) between tag and UUID
+    LEAF_RE      = re.compile(
+        r'leaf_message.{1,25}'
+        r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    )
+    SENDER_RE    = re.compile(r'sender["\s\x00-\x1f]{0,10}(human|assistant)', re.I)
+
+    # Noise strings to filter out of titles
+    NOI_TITLE = ["anthropic.com","http","MANIFEST","claude.ai","<server",
+                 "onT","offF","defaultValue","experimentResult",
+                 "ruleId","dataUpdate","current_acc","user_","assistant"]
+
+    # ── PASS 1: Extract conversation metadata from large blob(s) ──────────
+    # conv_map: {conv_uuid → {title, ts, model, leaf_uuid}}
+    conv_map: dict = {}
+
+    for fpath in conv_blobs:
+        raw = _safe_read(fpath)
+        if len(raw) < 100:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+
+        # Find all conversation-level uuid matches
+        # Also search raw bytes for '$'-prefixed UUIDs that CONV_UUID_RE may miss
+        for um in CONV_UUID_RE.finditer(text):
+            cid = um.group(1)
+            window = text[um.start(): um.start() + 1000]
+
+            nm = NAME_RE.search(window)
+            if not nm:
+                continue
+
+            title = nm.group(1).strip()
+            # Filter noise
+            if any(n in title for n in NOI_TITLE):
+                continue
+            alpha = sum(1 for c in title if c.isalpha())
+            if alpha < len(title) * 0.35 or len(title) > 120:
+                continue
+
+            ts = 0.0
+            udm = UPD_RE.search(window)
+            if udm:
+                try:
+                    ts = datetime.fromisoformat(
+                        udm.group(1).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    pass
+
+            model_m = MODEL_RE.search(window)
+            model = model_m.group(1) if model_m else ""
+
+            # Find leaf_message uuid (the latest message uuid)
+            leaf_m = LEAF_RE.search(window)
+            leaf_uuid = leaf_m.group(1) if leaf_m else ""
+
+            if cid not in conv_map or ts > conv_map[cid].get("ts", 0):
+                conv_map[cid] = {
+                    "title": title,
+                    "ts": ts,
+                    "model": model,
+                    "leaf_uuid": leaf_uuid,
+                }
+
+    # ── PASS 2: Extract message content from message blobs ────────────────
+    # msg_map: {msg_uuid → {role, text}}
+    msg_map: dict = {}
+
+    for fpath in all_blobs:
+        raw = _safe_read(fpath)
+        if len(raw) < 20:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+
+        # Message blobs have: uuid → user_/sender → content → sender"human/assistant"
+        # Look for uuid4 patterns followed by readable text + sender tag
+        for um in UUID4_RE.finditer(text):
+            mid = um.group(1)
+            zone = text[um.start(): um.start() + 3000]
+
+            # Check it has sender marker (conversation blobs have this too but
+            # message blobs have very clean text runs near sender)
+            sender_m = SENDER_RE.search(zone)
+            if not sender_m:
+                continue
+
+            role = "user" if sender_m.group(1).lower() == "human" else "assistant"
+
+            # V8 blob stores message text in a 'text"' field before sender tag.
+            # Raw: ...text"[NUL][len]i want u to write me a[len]sender"human"...
+            # Strategy 1: find explicit text" field
+            best = ""
+            tf_pos = zone.find('text"')
+            if tf_pos >= 0 and tf_pos < sender_m.start():
+                # content starts a few bytes after 'text"'
+                txt_zone = zone[tf_pos + 5: tf_pos + 4005]
+                runs = re.findall(r'[A-Za-z][^\x00-\x08\x0b\x0e-\x1f]{14,4000}', txt_zone)
+                for run in runs:
+                    run = run.strip()
+                    run = re.split(
+                        r'(?:uuid|name"|sender|updated_a|model"|leaf_message|is_temp)',
+                        run)[0].strip()
+                    if is_real(run) and len(run) >= 15:
+                        best = run[:4000]
+                        break
+
+            # Strategy 2: last 600 chars before sender tag
+            if not best:
+                before = zone[max(0, sender_m.start()-600): sender_m.start()]
+                runs = re.findall(r'[A-Za-z][^\x00-\x08\x0b\x0e-\x1f]{14,2000}', before)
+                for run in runs:
+                    run = run.strip()
+                    run = re.split(
+                        r'(?:uuid|name"|sender|updated_a|model"|leaf_message|is_temp)',
+                        run)[0].strip()
+                    if is_real(run) and len(run) >= 15 and len(run) > len(best):
+                        best = run[:4000]
+
+
+            # Strip V8 binary prefix (type/u/t/{X+ chars before actual text)
+            if best:
+                # Aggressive strip: remove non-ascii and up to 15 leading chars if they look like V8 tags
+                clean = re.sub(r'^(?:(?:type|user|text|human)[\s\x00-\x1fA-Za-z0-9+/{\[]*?)?[^A-Za-z0-9]+', '', best)
+                if not clean or len(clean) < 10: clean = best.split('+', 1)[-1].strip() if '+' in best[:50] else best[10:].strip()
+                if len(clean) >= 10:
+                    best = clean
+            if best and mid not in msg_map:
+                msg_map[mid] = {"role": role, "text": best}
+
+    # ── JOIN: Merge conversations with their leaf message content ─────────
+    items = []
+    for cid, conv in conv_map.items():
+        title     = conv["title"]
+        ts        = conv["ts"]
+        model     = conv["model"]
+        leaf_uuid = conv["leaf_uuid"]
+
+        msg = msg_map.get(leaf_uuid) if leaf_uuid else None
+
+        if msg:
+            items.append({
+                "conversation_id": cid,
+                "current_node_id": leaf_uuid,
+                "title": title,
+                "model": model,
+                "is_archived": False,
+                "is_starred":  False,
+                "update_time": ts,
+                "payload": {
+                    "kind": "message",
+                    "message_id": leaf_uuid,
+                    "snippet": msg["text"],
+                    "role": msg["role"],
+                }
+            })
+        else:
+            items.append({
+                "conversation_id": cid,
+                "current_node_id": "",
+                "title": title,
+                "model": model,
+                "is_archived": False,
+                "is_starred":  False,
+                "update_time": ts,
+                "payload": {
+                    "kind": "message",
+                    "message_id": "",
+                    "snippet": "[No content recovered — metadata only]",
+                    "role": "",
+                }
+            })
+
+    # Deduplicate
+    seen_idb: set = set()
+    deduped = []
+    for it in items:
+        key = f"{it['conversation_id']}::{it['payload']['snippet'][:60]}"
+        k   = hashlib.md5(key.encode()).hexdigest()
+        if k not in seen_idb:
+            seen_idb.add(k)
+            deduped.append(it)
+    return deduped
+
+def run_claude(paths: dict):
+    print("  [1/4] Attempting live cache extraction …")
     live_items = []
     try:
         import claude_extractor
@@ -402,8 +629,19 @@ def run_claude(paths: dict):
     except Exception as e:
         print(f"      → Live extraction failed: {e}")
 
-    # ── Use RECOVERED_CLAUDE_HISTORY.json as primary source ───────────────
-    print("  [2/3] Loading previously recovered Claude history …")
+    # ── Stage 2: IndexedDB Blob scan (where latest chats live!) ──────────
+    print("  [2/4] Scanning IndexedDB blob (latest conversations) …")
+    idb_items = []
+    try:
+        idb_items = _scan_claude_idb_blob(paths)
+        real_idb  = sum(1 for x in idb_items
+                        if not x["payload"]["snippet"].startswith("[No content"))
+        print(f"      → {len(idb_items)} items from IDB blob ({real_idb} with real content)")
+    except Exception as e:
+        print(f"      → IDB blob scan failed: {e}")
+
+    # ── Stage 3: RECOVERED_CLAUDE_HISTORY.json ───────────────────────────
+    print("  [3/4] Loading previously recovered Claude history …")
     rec_file = os.path.join(REPORTS, "RECOVERED_CLAUDE_HISTORY.json")
     rec_items = []
     if os.path.isfile(rec_file):
@@ -413,8 +651,9 @@ def run_claude(paths: dict):
     else:
         print(f"      → {rec_file} not found")
 
-    # ── Merge all items — real content AND metadata-only ─────────────────
-    print("  [3/3] Merging & deduplicating …")
+
+    # ── Stage 4: Merge all items — real content AND metadata-only ─────────────────
+    print("  [4/4] Merging & deduplicating …")
 
     _TS_PAT = re.compile(r'(?:updated|created)=(\d{4}-\d{2}-\d{2}T[\d:.]+Z?)')
 
@@ -462,22 +701,29 @@ def run_claude(paths: dict):
 
     def add_item(item: dict):
         clean = _clean_item(item)
-        cid  = clean["conversation_id"]
-        mid  = clean["current_node_id"] or clean["payload"]["message_id"]
-        snip = clean["payload"]["snippet"]
-        # Dedup key: (cid, mid) or (cid, snippet_hash) for meta-only
+        cid   = clean["conversation_id"]
+        # Prefer message_id as it's truly unique per message; current_node_id is often per-turn
+        mid   = clean["payload"].get("message_id") or clean["current_node_id"]
+        role  = clean["payload"].get("role") or ""
+        snip  = clean.get("payload", {}).get("snippet", "")
+
+        # Dedup key: (cid, mid, role) or (cid, snippet_hash) for meta-only
         if mid:
-            key = f"{cid}::{mid}"
+            key = f"{cid}::{mid}::{role}"
         else:
             key = f"{cid}::{hashlib.md5(snip[:80].encode()).hexdigest()}"
+
         if key not in seen_keys:
             seen_keys.add(key)
             out_items.append(clean)
 
-    # RECOVERED_CLAUDE_HISTORY first (richer — all 23 entries including meta)
+    # IDB blob first — has the LATEST conversations
+    for item in idb_items:
+        add_item(item)
+    # RECOVERED_CLAUDE_HISTORY next (historical depth)
     for item in rec_items:
         add_item(item)
-    # Live cache on top
+    # Live cache last
     for item in live_items:
         add_item(item)
 
@@ -591,8 +837,8 @@ BANNER = r"""
 MENU = """
   Select Application:
   ─────────────────────────────────────────
-    1.  ChatGPT    (LevelDB + Cache + Historical)
-    2.  Claude     (Cache + RECOVERED_CLAUDE_HISTORY)
+    1.  ChatGPT
+    2.  Claude
     0.  Exit
   ─────────────────────────────────────────
   Enter choice [0/1/2]: """
@@ -647,7 +893,12 @@ def main():
             run_chatgpt(paths)
         else:
             run_claude(paths)
-        print(f"\n  Completed in {time.time()-t0:.1f}s")
+        elapsed = time.time() - t0
+        print(f"\n  Completed in {elapsed:.1f}s")
+        print(f"\n  📂 Reports saved to:")
+        label = "CHATGPT" if choice == "1" else "CLAUDE"
+        print(f"      {os.path.join(REPORTS, label + '_FORENSIC_REPORT.json')}")
+        print(f"      {os.path.join(REPORTS, label + '_FORENSIC_REPORT.md')}")
 
         try:
             again = input("\n  Run another? [y/N]: ").strip().lower()
