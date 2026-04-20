@@ -16,17 +16,27 @@ Steps performed:
      • reports/CLAUDE_FORENSIC_REPORT.md
 """
 
-import sys, io, os, re, json, glob, struct, shutil, hashlib, gzip
+import sys
+import io
+import os
+import re
+import json
+import glob
+import struct
+import shutil
+import hashlib
+import gzip
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-BASE    = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.abspath(__file__))
 REPORTS = os.path.join(BASE, "reports")
 os.makedirs(REPORTS, exist_ok=True)
 
-LOCAL   = os.getenv("LOCALAPPDATA", "")
+LOCAL = os.getenv("LOCALAPPDATA", "")
 APPDATA = os.getenv("APPDATA", "")
-IST     = 5.5 * 3600   # seconds offset for IST
+IST = 5.5 * 3600   # seconds offset for IST
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -38,6 +48,7 @@ def ts_ist(ts: float) -> str:
         return "Unknown"
     return datetime.fromtimestamp(ts + IST, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S IST")
 
+
 def _safe_read(path: str) -> bytes:
     try:
         tmp = path + f"._r{os.getpid()}"
@@ -48,6 +59,7 @@ def _safe_read(path: str) -> bytes:
         return data
     except Exception:
         return b""
+
 
 def _snappy_sliding(raw: bytes):
     try:
@@ -65,8 +77,10 @@ def _snappy_sliding(raw: bytes):
     except ImportError:
         return []
 
+
 def _sep(c="─", w=62):
     print(c * w)
+
 
 def _header(title: str):
     _sep("═")
@@ -74,8 +88,9 @@ def _header(title: str):
     _sep("═")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SNIPPET QUALITY GATE (shared by both pipelines)
+# Noise Filtering
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 _NOISE = [
     "[No cached content]", '{"conversation_id"', "}},",
@@ -88,6 +103,7 @@ _NOISE = [
 ]
 _JSON_RE = re.compile(r'\{["\w]+:')
 _HTML_RE = re.compile(r'<[a-zA-Z][^>]{0,30}>')
+
 
 def is_real(s: str) -> bool:
     if not s or len(s.strip()) < 15:
@@ -115,7 +131,7 @@ def discover_chatgpt_paths() -> dict:
     if not roots:
         return {}
     root = roots[0]
-    idb  = os.path.join(root, "IndexedDB")
+    idb = os.path.join(root, "IndexedDB")
     return {
         "app_root": root,
         "idb_ldb":  os.path.join(idb, "https_chatgpt.com_0.indexeddb.leveldb"),
@@ -123,6 +139,7 @@ def discover_chatgpt_paths() -> dict:
         "ls_ldb":   os.path.join(root, "Local Storage", "leveldb"),
         "cache":    os.path.join(root, "Cache", "Cache_Data"),
     }
+
 
 def discover_claude_paths() -> dict:
     """Find Claude Desktop app data directories."""
@@ -133,7 +150,8 @@ def discover_claude_paths() -> dict:
         os.path.join(LOCAL,   "Claude"),
     ]
     for cand in candidates:
-        roots = glob.glob(cand) if "*" in cand else ([cand] if os.path.isdir(cand) else [])
+        roots = glob.glob(
+            cand) if "*" in cand else ([cand] if os.path.isdir(cand) else [])
         if roots:
             root = roots[0]
             return {
@@ -144,6 +162,7 @@ def discover_claude_paths() -> dict:
             }
     return {}
 
+
 def _scan_dirs(paths: dict) -> list:
     """Print detected directories and return list of found ones."""
     found = []
@@ -152,10 +171,10 @@ def _scan_dirs(paths: dict) -> list:
             continue
         exists = os.path.isdir(path)
         status = "✓ FOUND" if exists else "✗ missing"
-        fc     = ""
+        fc = ""
         if exists:
             files = glob.glob(os.path.join(path, "**", "*"), recursive=True)
-            fc    = f"  ({len(files)} files)"
+            fc = f"  ({len(files)} files)"
         print(f"    [{status}] {label}: {path}{fc}")
         if exists:
             found.append(path)
@@ -171,9 +190,11 @@ def _ls_conversation_history(ls_dir: str) -> list:
     results = []
     all_files = (
         sorted(glob.glob(os.path.join(ls_dir, "*.log")), key=os.path.getmtime, reverse=True) +
-        sorted(glob.glob(os.path.join(ls_dir, "*.ldb")), key=os.path.getmtime, reverse=True)
+        sorted(glob.glob(os.path.join(ls_dir, "*.ldb")),
+               key=os.path.getmtime, reverse=True)
     )
-    pat = re.compile(r'conversation-history[^\{]{0,40}(\{"value":\{"pages":\[)')
+    pat = re.compile(
+        r'conversation-history[^\{]{0,40}(\{"value":\{"pages":\[)')
     for fpath in all_files:
         raw = _safe_read(fpath)
         if not raw:
@@ -184,9 +205,13 @@ def _ls_conversation_history(ls_dir: str) -> list:
             depth, end = 0, start
             for i in range(start, min(start + 800_000, len(text))):
                 c = text[i]
-                if c == "{":   depth += 1
-                elif c == "}": depth -= 1
-                if depth == 0: end = i + 1; break
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
             if end <= start:
                 continue
             try:
@@ -198,14 +223,14 @@ def _ls_conversation_history(ls_dir: str) -> list:
                 for item in (page.get("items") or []):
                     if not isinstance(item, dict):
                         continue
-                    cid   = (item.get("id") or "").strip()
+                    cid = (item.get("id") or "").strip()
                     title = (item.get("title") or "").strip()
-                    ts    = 0.0
-                    for ts_str in (item.get("update_time",""), item.get("create_time","")):
+                    ts = 0.0
+                    for ts_str in (item.get("update_time", ""), item.get("create_time", "")):
                         if ts_str:
                             try:
                                 ts = datetime.fromisoformat(
-                                    ts_str.replace("Z","+00:00")).timestamp()
+                                    ts_str.replace("Z", "+00:00")).timestamp()
                                 break
                             except Exception:
                                 pass
@@ -233,8 +258,7 @@ def run_chatgpt(paths: dict):
     _sep("─")
 
     SKIP = {"Unknown (deleted/orphaned conversation)", "New chat", "Student",
-            "What is 5", "What is apple", "Test message response",
-            "Testing cache behavior", "Deleted Fragment Recovery", ""}
+            "Test message response", "Testing cache behavior", "Deleted Fragment Recovery", ""}
 
     convs: dict = {}
 
@@ -255,7 +279,7 @@ def run_chatgpt(paths: dict):
         if trust_ts and ts > float(prev["ts"] or 0) and ts < 1_773_902_000:
             prev["ts"] = ts
         prev["is_archived"] = is_arch or prev["is_archived"]
-        prev["is_starred"]  = is_star or prev["is_starred"]
+        prev["is_starred"] = is_star or prev["is_starred"]
         seen = {m["snippet"][:100] for m in prev["msgs"]}
         for m in msgs:
             if m["snippet"][:100] not in seen:
@@ -274,17 +298,16 @@ def run_chatgpt(paths: dict):
                             "ts":      float(m.get("timestamp") or m.get("update_time") or ts)})
         return out
 
-    # ── STEP 1: Full live scan (IDB LDB + Blob + Cache) — works on any machine ──
-    print("  [1/3] Full LevelDB + Blob + Cache scan (live) …")
+    print("  [1/3] Full LevelDB + Cache scan (live) …")
     try:
         import chatgpt_extractor as cex
         live_convs = cex.run(verbose=False)
         for item in live_convs:
-            cid   = (item.get("conversation_id") or "").strip()
+            cid = (item.get("conversation_id") or "").strip()
             title = (item.get("title") or "").strip()
             if title in SKIP:
                 continue
-            ts   = float(item.get("update_time") or 0)
+            ts = float(item.get("update_time") or 0)
             msgs = conv_to_msgs(item)
             upsert(cid, title, ts,
                    bool(item.get("is_archived")), bool(item.get("is_starred")),
@@ -294,17 +317,16 @@ def run_chatgpt(paths: dict):
     except Exception as e:
         print(f"      [warn] Live scan error: {e}")
 
-    # ── STEP 2: Apply accurate per-conversation timestamps from LS WAL ──
     print("  [2/3] Applying accurate timestamps from Local Storage …")
     ls_dir = paths.get("ls_ldb", "")
     if os.path.isdir(ls_dir):
         ch = _ls_conversation_history(ls_dir)
         applied = 0
         for entry in ch:
-            ecid  = entry.get("conversation_id", "")
-            etitle= entry.get("title", "")
-            ets   = float(entry.get("update_time") or 0)
-            key   = ecid if ecid else etitle[:40]
+            ecid = entry.get("conversation_id", "")
+            etitle = entry.get("title", "")
+            ets = float(entry.get("update_time") or 0)
+            key = ecid if ecid else etitle[:40]
             if key in convs and ets > 1e9:
                 convs[key]["ts"] = ets
                 if etitle:
@@ -314,40 +336,81 @@ def run_chatgpt(paths: dict):
     else:
         print("      → Local Storage not found")
 
-    # ── STEP 3 (optional): Merge historical data if present ──
     old_file = os.path.join(REPORTS, "RECOVERED_CHATGPT_GROUPED.json")
     if os.path.isfile(old_file):
-        print("  [3/3] Merging historical data (RECOVERED_CHATGPT_GROUPED.json) …")
+        print("  [3/4] Merging historical data (RECOVERED_CHATGPT_GROUPED.json) …")
         try:
-            old_raw   = json.load(open(old_file, encoding="utf-8"))
-            old_items = old_raw if isinstance(old_raw, list) else old_raw.get("items", [])
+            old_raw = json.load(open(old_file, encoding="utf-8"))
+            old_items = old_raw if isinstance(
+                old_raw, list) else old_raw.get("items", [])
             pre = len(convs)
             for item in old_items:
-                cid   = (item.get("conversation_id") or "").strip()
+                cid = (item.get("conversation_id") or "").strip()
                 title = (item.get("title") or "").strip()
                 if title in SKIP:
                     continue
-                ts   = float(item.get("latest_update") or item.get("update_time") or 0)
+                ts = float(item.get("latest_update")
+                           or item.get("update_time") or 0)
                 msgs = conv_to_msgs(item)
                 upsert(cid, title, ts,
-                       bool(item.get("is_archived")), bool(item.get("is_starred")),
+                       bool(item.get("is_archived")), bool(
+                           item.get("is_starred")),
                        msgs, trust_ts=(ts < 1_773_901_000))
             added = len(convs) - pre
-            print(f"      → {len(old_items)} records, {added} new conversations added from history")
+            print(
+                f"      → {len(old_items)} records, {added} new conversations added from history")
         except Exception as e:
             print(f"      [warn] Historical merge failed: {e}")
     else:
-        print("  [3/3] No historical file — running in portable (live-only) mode")
+        print("  [3/4] No historical file — running in portable (live-only) mode")
+
+    print("  [4/4] Scanning LevelDB logs (WAL) for very latest chats …")
+    wal_files = glob.glob(os.path.join(ls_dir, "*.log"))
+    if wal_files:
+        found_wal = 0
+        for fpath in wal_files:
+            raw = _safe_read(fpath)
+            if len(raw) < 100:
+                continue
+            text = raw.decode("utf-8", errors="replace")
+            # Look for conversation_id fragments (regular UUID4)
+            for cid_m in re.finditer(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', text):
+                cid = cid_m.group(1)
+                window = text[cid_m.start(): cid_m.start() + 4000]
+                # Carve latest readable strings
+                runs = re.findall(r'[A-Za-z][^\x00-\x1f]{20,3000}', window)
+                for run in runs:
+                    if is_real(run) and len(run) >= 35:
+                        key = cid
+                        if key in convs:
+                            seen = {m["snippet"][:100]
+                                    for m in convs[key]["msgs"]}
+                            if run[:100] not in seen:
+                                # Guess role
+                                role = "assistant"
+                                if "user" in window[max(0, window.find(run)-100): window.find(run)]:
+                                    role = "user"
+                                convs[key]["msgs"].append({
+                                    "mid": "", "role": role, "snippet": run[:4000], "ts": time.time()
+                                })
+                                found_wal += 1
+                                break
+        if found_wal:
+            print(
+                f"      → {found_wal} 'live' snippets recovered from WAL logs")
+    else:
+        print("      → No WAL log files found to carve")
 
     # ── Build output ────────────────────────────────────────────
     print("      Building report …")
-    clist = sorted(convs.values(), key=lambda c: float(c["ts"] or 0), reverse=True)
+    clist = sorted(convs.values(), key=lambda c: float(
+        c["ts"] or 0), reverse=True)
     out_items = []
     for conv in clist:
-        cid   = conv["cid"]
+        cid = conv["cid"]
         title = conv["title"]
-        ts    = float(conv["ts"] or 0)
-        msgs  = sorted(conv["msgs"], key=lambda m: m.get("ts", 0))
+        ts = float(conv["ts"] or 0)
+        msgs = sorted(conv["msgs"], key=lambda m: m.get("ts", 0))
         if not msgs:
             out_items.append({
                 "conversation_id": cid, "current_node_id": "",
@@ -367,6 +430,7 @@ def run_chatgpt(paths: dict):
                     "payload": {"kind": "message", "message_id": m["mid"],
                                 "snippet": m["snippet"], "role": m["role"]}
                 })
+
 
 def _scan_claude_idb_blob(paths: dict) -> list:
     """
@@ -391,11 +455,15 @@ def _scan_claude_idb_blob(paths: dict) -> list:
         return []
     blob_base = blob_dirs[0]
 
-    # Gather all blob files, split by size
+    # Gather all blob files + LevelDB logs (WAL) to catch latest un-compacted chats
     all_blobs = (
         glob.glob(os.path.join(blob_base, "1", "*")) +
         glob.glob(os.path.join(blob_base, "1", "**", "*"), recursive=True)
     )
+    # Include LevelDB .log files from the IndexedDB structure
+    all_blobs += glob.glob(os.path.join(idb_root, "**",
+                           "*.log"), recursive=True)
+
     all_blobs = [f for f in all_blobs if os.path.isfile(f)]
     if not all_blobs:
         return []
@@ -406,27 +474,30 @@ def _scan_claude_idb_blob(paths: dict) -> list:
     # V8 blobs encode strings with length-prefix bytes before content
     # UUIDs appear as: uuid"[\x04][\x24]a1a60db8-... OR uuid"$a1a60db8-...
     # The \x24 IS the '$' character (ASCII 36)
-    UUID4_RE     = re.compile(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
+    UUID4_RE = re.compile(
+        r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
     CONV_UUID_RE = re.compile(
         r'uuid["\s\x00-\x1f$]{0,12}'
         r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
     )
-    NAME_RE      = re.compile(r'name["\s\x00-\x1f]{0,8}([^\x00-\x1f"\\]{3,120})')
-    UPD_RE       = re.compile(r'updated_a[tN\x00-\x1f][".\s\x00-\x1f]{0,10}(\d{4}-\d{2}-\d{2}T[\d:.]+Z?)')
-    MODEL_RE     = re.compile(r'(claude-[a-z0-9\-]{3,30})')
+    NAME_RE = re.compile(r'name["\s\x00-\x1f]{0,8}([^\x00-\x1f"\\]{3,120})')
+    UPD_RE = re.compile(
+        r'updated_a[tN\x00-\x1f][".\s\x00-\x1f]{0,10}(\d{4}-\d{2}-\d{2}T[\d:.]+Z?)')
+    MODEL_RE = re.compile(r'(claude-[a-z0-9\-]{3,30})')
     # leaf_message UUID: 5+ arbitrary bytes between key and UUID
     # Observed: leaf_message[05]>\xef\xbf\xbd"$019d0472-...
     # Allow any non-hex chars (up to 20) between tag and UUID
-    LEAF_RE      = re.compile(
+    LEAF_RE = re.compile(
         r'leaf_message.{1,25}'
         r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
     )
-    SENDER_RE    = re.compile(r'sender["\s\x00-\x1f]{0,10}(human|assistant)', re.I)
+    SENDER_RE = re.compile(
+        r'sender["\s\x00-\x1f]{0,10}(human|assistant)', re.I)
 
     # Noise strings to filter out of titles
-    NOI_TITLE = ["anthropic.com","http","MANIFEST","claude.ai","<server",
-                 "onT","offF","defaultValue","experimentResult",
-                 "ruleId","dataUpdate","current_acc","user_","assistant"]
+    NOI_TITLE = ["anthropic.com", "http", "MANIFEST", "claude.ai", "<server",
+                 "onT", "offF", "defaultValue", "experimentResult",
+                 "ruleId", "dataUpdate", "current_acc", "user_", "assistant"]
 
     # ── PASS 1: Extract conversation metadata from large blob(s) ──────────
     # conv_map: {conv_uuid → {title, ts, model, leaf_uuid}}
@@ -502,7 +573,8 @@ def _scan_claude_idb_blob(paths: dict) -> list:
             if not sender_m:
                 continue
 
-            role = "user" if sender_m.group(1).lower() == "human" else "assistant"
+            role = "user" if sender_m.group(
+                1).lower() == "human" else "assistant"
 
             # V8 blob stores message text in a 'text"' field before sender tag.
             # Raw: ...text"[NUL][len]i want u to write me a[len]sender"human"...
@@ -512,7 +584,8 @@ def _scan_claude_idb_blob(paths: dict) -> list:
             if tf_pos >= 0 and tf_pos < sender_m.start():
                 # content starts a few bytes after 'text"'
                 txt_zone = zone[tf_pos + 5: tf_pos + 4005]
-                runs = re.findall(r'[A-Za-z][^\x00-\x08\x0b\x0e-\x1f]{14,4000}', txt_zone)
+                runs = re.findall(
+                    r'[A-Za-z][^\x00-\x08\x0b\x0e-\x1f]{14,4000}', txt_zone)
                 for run in runs:
                     run = run.strip()
                     run = re.split(
@@ -525,7 +598,8 @@ def _scan_claude_idb_blob(paths: dict) -> list:
             # Strategy 2: last 600 chars before sender tag
             if not best:
                 before = zone[max(0, sender_m.start()-600): sender_m.start()]
-                runs = re.findall(r'[A-Za-z][^\x00-\x08\x0b\x0e-\x1f]{14,2000}', before)
+                runs = re.findall(
+                    r'[A-Za-z][^\x00-\x08\x0b\x0e-\x1f]{14,2000}', before)
                 for run in runs:
                     run = run.strip()
                     run = re.split(
@@ -534,12 +608,14 @@ def _scan_claude_idb_blob(paths: dict) -> list:
                     if is_real(run) and len(run) >= 15 and len(run) > len(best):
                         best = run[:4000]
 
-
             # Strip V8 binary prefix (type/u/t/{X+ chars before actual text)
             if best:
                 # Aggressive strip: remove non-ascii and up to 15 leading chars if they look like V8 tags
-                clean = re.sub(r'^(?:(?:type|user|text|human)[\s\x00-\x1fA-Za-z0-9+/{\[]*?)?[^A-Za-z0-9]+', '', best)
-                if not clean or len(clean) < 10: clean = best.split('+', 1)[-1].strip() if '+' in best[:50] else best[10:].strip()
+                clean = re.sub(
+                    r'^(?:(?:type|user|text|human)[\s\x00-\x1fA-Za-z0-9+/{\[]*?)?[^A-Za-z0-9]+', '', best)
+                if not clean or len(clean) < 10:
+                    clean = best.split(
+                        '+', 1)[-1].strip() if '+' in best[:50] else best[10:].strip()
                 if len(clean) >= 10:
                     best = clean
             if best and mid not in msg_map:
@@ -548,9 +624,9 @@ def _scan_claude_idb_blob(paths: dict) -> list:
     # ── JOIN: Merge conversations with their leaf message content ─────────
     items = []
     for cid, conv in conv_map.items():
-        title     = conv["title"]
-        ts        = conv["ts"]
-        model     = conv["model"]
+        title = conv["title"]
+        ts = conv["ts"]
+        model = conv["model"]
         leaf_uuid = conv["leaf_uuid"]
 
         msg = msg_map.get(leaf_uuid) if leaf_uuid else None
@@ -593,11 +669,12 @@ def _scan_claude_idb_blob(paths: dict) -> list:
     deduped = []
     for it in items:
         key = f"{it['conversation_id']}::{it['payload']['snippet'][:60]}"
-        k   = hashlib.md5(key.encode()).hexdigest()
+        k = hashlib.md5(key.encode()).hexdigest()
         if k not in seen_idb:
             seen_idb.add(k)
             deduped.append(it)
     return deduped
+
 
 def run_claude(paths: dict):
     print("  [1/4] Attempting live cache extraction …")
@@ -607,22 +684,22 @@ def run_claude(paths: dict):
         live_convs = claude_extractor.run(verbose=False)
         for h in live_convs:
             for m in h.get("messages", []):
-                snip = m.get("snippet","").strip()
+                snip = m.get("snippet", "").strip()
                 if not is_real(snip):
                     continue
                 live_items.append({
-                    "conversation_id": h.get("conversation_id",""),
-                    "current_node_id": m.get("message_id",""),
-                    "title": h.get("title",""),
-                    "model": h.get("model",""),
+                    "conversation_id": h.get("conversation_id", ""),
+                    "current_node_id": m.get("message_id", ""),
+                    "title": h.get("title", ""),
+                    "model": h.get("model", ""),
                     "is_archived": False,
                     "is_starred":  False,
                     "update_time": float(h.get("update_time") or 0),
                     "payload": {
                         "kind": "message",
-                        "message_id": m.get("message_id",""),
+                        "message_id": m.get("message_id", ""),
                         "snippet": snip[:4000],
-                        "role": m.get("role","unknown")
+                        "role": m.get("role", "unknown")
                     }
                 })
         print(f"      → {len(live_items)} live messages found")
@@ -634,9 +711,10 @@ def run_claude(paths: dict):
     idb_items = []
     try:
         idb_items = _scan_claude_idb_blob(paths)
-        real_idb  = sum(1 for x in idb_items
-                        if not x["payload"]["snippet"].startswith("[No content"))
-        print(f"      → {len(idb_items)} items from IDB blob ({real_idb} with real content)")
+        real_idb = sum(1 for x in idb_items
+                       if not x["payload"]["snippet"].startswith("[No content"))
+        print(
+            f"      → {len(idb_items)} items from IDB blob ({real_idb} with real content)")
     except Exception as e:
         print(f"      → IDB blob scan failed: {e}")
 
@@ -645,12 +723,12 @@ def run_claude(paths: dict):
     rec_file = os.path.join(REPORTS, "RECOVERED_CLAUDE_HISTORY.json")
     rec_items = []
     if os.path.isfile(rec_file):
-        rec_raw  = json.load(open(rec_file, encoding="utf-8"))
+        rec_raw = json.load(open(rec_file, encoding="utf-8"))
         rec_items = rec_raw.get("items", [])
-        print(f"      → {len(rec_items)} items in RECOVERED_CLAUDE_HISTORY.json")
+        print(
+            f"      → {len(rec_items)} items in RECOVERED_CLAUDE_HISTORY.json")
     else:
         print(f"      → {rec_file} not found")
-
 
     # ── Stage 4: Merge all items — real content AND metadata-only ─────────────────
     print("  [4/4] Merging & deduplicating …")
@@ -670,7 +748,7 @@ def run_claude(paths: dict):
     def _clean_item(item: dict) -> dict:
         """Return a schema-clean copy — remove source_file, fix timestamps."""
         snip = (item.get("payload", {}).get("snippet") or "").strip()
-        ts   = float(item.get("update_time") or 0)
+        ts = float(item.get("update_time") or 0)
 
         # For meta-only: parse better ts from snippet if main ts looks wrong
         is_meta = snip.startswith("[No cached content]") or not is_real(snip)
@@ -701,11 +779,11 @@ def run_claude(paths: dict):
 
     def add_item(item: dict):
         clean = _clean_item(item)
-        cid   = clean["conversation_id"]
+        cid = clean["conversation_id"]
         # Prefer message_id as it's truly unique per message; current_node_id is often per-turn
-        mid   = clean["payload"].get("message_id") or clean["current_node_id"]
-        role  = clean["payload"].get("role") or ""
-        snip  = clean.get("payload", {}).get("snippet", "")
+        mid = clean["payload"].get("message_id") or clean["current_node_id"]
+        role = clean["payload"].get("role") or ""
+        snip = clean.get("payload", {}).get("snippet", "")
 
         # Dedup key: (cid, mid, role) or (cid, snippet_hash) for meta-only
         if mid:
@@ -740,7 +818,6 @@ def run_claude(paths: dict):
     _write_report("CLAUDE", list(cid_set), out_items, is_claude=True)
 
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # REPORT WRITER (single-file output)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -748,12 +825,12 @@ def run_claude(paths: dict):
 def _write_report(app: str, clist, out_items: list, is_claude: bool = False):
     now = ts_ist(datetime.utcnow().timestamp())
     total_convs = len(clist)
-    total_msgs  = len(out_items)
+    total_msgs = len(out_items)
     with_content = sum(1 for x in out_items
                        if not x["payload"]["snippet"].startswith("[No content"))
 
     json_path = os.path.join(REPORTS, f"{app}_FORENSIC_REPORT.json")
-    md_path   = os.path.join(REPORTS, f"{app}_FORENSIC_REPORT.md")
+    md_path = os.path.join(REPORTS, f"{app}_FORENSIC_REPORT.md")
 
     # ── JSON ──────────────────────────────────────────────────────────────
     output = {
@@ -789,16 +866,18 @@ def _write_report(app: str, clist, out_items: list, is_claude: bool = False):
 
     # Sort conversations by newest message
     def conv_ts(items_list):
-        return max((float(x.get("update_time",0)) for x in items_list), default=0)
+        return max((float(x.get("update_time", 0)) for x in items_list), default=0)
 
     for cid, citems in sorted(by_conv.items(), key=lambda kv: conv_ts(kv[1]), reverse=True):
-        title = citems[0].get("title","(untitled)")
-        ts    = conv_ts(citems)
+        title = citems[0].get("title", "(untitled)")
+        ts = conv_ts(citems)
         lines.append(f"\n## {title}\n\n")
         lines.append(f"**Last updated (IST):** {ts_ist(ts)}  \n")
         lines.append(f"**Conversation ID:** `{cid}`\n\n")
-        msgs_sorted = sorted(citems, key=lambda x: float(x.get("update_time",0)))
-        has_real = any(not x["payload"]["snippet"].startswith("[No content") for x in msgs_sorted)
+        msgs_sorted = sorted(
+            citems, key=lambda x: float(x.get("update_time", 0)))
+        has_real = any(not x["payload"]["snippet"].startswith(
+            "[No content") for x in msgs_sorted)
         if not has_real:
             lines.append("*[No message content recovered — metadata only]*\n")
         else:
@@ -807,7 +886,7 @@ def _write_report(app: str, clist, out_items: list, is_claude: bool = False):
                 if snip.startswith("[No content"):
                     continue
                 role = (item["payload"].get("role") or "unknown").upper()
-                mt   = ts_ist(float(item.get("update_time",0)))
+                mt = ts_ist(float(item.get("update_time", 0)))
                 lines.append(f"**[{mt}] {role}:**\n\n{snip}\n\n")
         lines.append("---\n")
 
@@ -846,8 +925,10 @@ MENU = """
 
 def main():
     # UTF-8 output for Windows terminal
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(
+        sys.stderr.buffer, encoding="utf-8", errors="replace")
     print(BANNER)
 
     while True:
@@ -857,7 +938,7 @@ def main():
             print("\n\n  Exiting.")
             break
 
-        if choice not in ("0","1","2"):
+        if choice not in ("0", "1", "2"):
             print("  Invalid choice.")
             continue
 
